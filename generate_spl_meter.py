@@ -1,34 +1,369 @@
 #!/usr/bin/env python3
 """
-SPL Meter HTML Generator
-=======================
+SPL Meter - Python Backend Version
+===================================
 
-A Python script to generate and serve the SPL Meter web app locally.
-This script creates the complete HTML file and optionally starts a local server.
+A local SPL measurement application where:
+- Python handles all audio capture and SPL calculations
+- HTML/JS is just the visual display
+- Communication via WebSocket for real-time updates
+
+This avoids browser microphone permission issues and provides more accurate
+measurements using PyAudio instead of Web Audio API.
+
+Requirements:
+    pip install pyaudio websockets
 
 Usage:
-    python generate_spl_meter.py [--serve] [--port PORT] [--output FILE]
+    python spl_meter_server.py [--port 8000] [--html spl_display.html]
 
-Options:
-    --serve     Start a local HTTP server after generating the file
-    --port PORT Specify the port for the server (default: 8000)
-    --output FILE  Specify output filename (default: spl_meter.html)
+Then open http://localhost:8000 in your browser.
 """
 
-import os
-import sys
 import argparse
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+import asyncio
+import json
+import math
+import struct
+import time
 from pathlib import Path
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import pyaudio
+import websockets
 
-HTML_TEMPLATE = r'''<!DOCTYPE html>
+
+class SPLCalculator:
+    """Handles all SPL calculation logic."""
+    
+    # Calibration offsets for different microphone types
+    CALIBRATION = {
+        'umik1': 128,      # UMIK-1: -34 dBFS at 94 dB SPL
+        'default': 94,      # Generic microphone approximation
+        'builtin': 94,      # Built-in laptop/desktop mics
+    }
+    
+    # Sample rate and chunk size
+    SAMPLE_RATE = 44100
+    CHUNK_SIZE = 1024
+    
+    def __init__(self, mic_type='default'):
+        """
+        Initialize SPL calculator.
+        
+        Args:
+            mic_type: Type of microphone ('umik1', 'default', 'builtin')
+        """
+        self.mic_type = mic_type
+        self.offset = self.CALIBRATION.get(mic_type, 94)
+        self.audio = None
+        self.stream = None
+        
+    def start_audio(self):
+        """Start PyAudio stream."""
+        self.audio = pyaudio.PyAudio()
+        self.stream = self.audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=self.CHUNK_SIZE
+        )
+        print(f"Audio stream started with {self.mic_type} calibration (offset: +{self.offset} dB)")
+        
+    def stop_audio(self):
+        """Stop PyAudio stream."""
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        if self.audio:
+            self.audio.terminate()
+        self.stream = None
+        self.audio = None
+        
+    def calculate_spl(self, audio_data):
+        """
+        Calculate SPL from raw audio data.
+        
+        Args:
+            audio_data: Raw bytes from PyAudio stream
+            
+        Returns:
+            dict: SPL reading with instant, averages, and peaks
+        """
+        # Convert bytes to numpy-like array (using struct for speed)
+        # Format: little-endian signed short (paInt16)
+        num_samples = len(audio_data) // 2
+        samples = struct.unpack(f'<{num_samples}h', audio_data)
+        
+        # Calculate RMS
+        sum_squares = sum(s * s for s in samples)
+        rms = math.sqrt(sum_squares / num_samples) if num_samples > 0 else 0
+        
+        # Handle zero RMS (silence)
+        if rms == 0:
+            return {'instant': 0.0, 'rms': 0.0, 'dbfs': float('-inf')}
+        
+        # Convert to dBFS
+        dbfs = 20 * math.log10(rms / 32768.0)  # 32768 = max 16-bit value
+        
+        # Convert to SPL using calibration offset
+        spl = dbfs + self.offset
+        
+        # Clamp to reasonable range
+        spl = max(0, min(140, spl))
+        
+        # Apply A-weighting approximation
+        spl = self.apply_a_weighting(spl)
+        
+        return {
+            'instant': round(spl, 1),
+            'rms': round(rms, 4),
+            'dbfs': round(dbfs, 1)
+        }
+    
+    def apply_a_weighting(self, spl):
+        """
+        Apply A-weighting curve approximation.
+        
+        Note: This is a simplified approximation. For accurate A-weighting,
+        FFT analysis would be needed to apply frequency-dependent corrections.
+        
+        Args:
+            spl: SPL value in dB
+            
+        Returns:
+            float: SPL with A-weighting applied
+        """
+        # Simple approximation: subtract ~2 dB for typical speech/music
+        # Real A-weighting would require FFT and frequency-based correction
+        return spl - 2
+
+
+class SPLDataManager:
+    """Manages SPL data storage and time-weighted averages."""
+    
+    def __init__(self):
+        self.readings = []
+        self.one_min_readings = []
+        self.one_hour_readings = []
+        self.eight_hour_readings = []
+        self.peak_1min = -float('inf')
+        self.peak_all = -float('inf')
+        self.peak_1min_reset_time = None
+        
+    def add_reading(self, spl, timestamp=None):
+        """
+        Add a new SPL reading and update all time windows.
+        
+        Args:
+            spl: SPL value in dB
+            timestamp: Optional timestamp (defaults to current time)
+            
+        Returns:
+            dict: Complete reading with all calculated values
+        """
+        if timestamp is None:
+            timestamp = time.time()
+        
+        reading = {
+            'timestamp': timestamp,
+            'instant': spl,
+            'one_min_avg': None,
+            'one_hour_avg': None,
+            'eight_hour_avg': None,
+            'peak': spl
+        }
+        
+        # Add to all storage
+        self.readings.append(reading)
+        self.one_min_readings.append(reading)
+        self.one_hour_readings.append(reading)
+        self.eight_hour_readings.append(reading)
+        
+        # Clean up old readings
+        now = timestamp
+        
+        # 1 minute window
+        cutoff_1min = now - 60
+        self.one_min_readings = [r for r in self.one_min_readings if r['timestamp'] >= cutoff_1min]
+        
+        # 1 hour window (clean every 10 readings to reduce overhead)
+        if len(self.readings) % 10 == 0:
+            cutoff_1hr = now - 3600
+            self.one_hour_readings = [r for r in self.one_hour_readings if r['timestamp'] >= cutoff_1hr]
+        
+        # 8 hour window (clean every 60 readings)
+        if len(self.readings) % 60 == 0:
+            cutoff_8hr = now - 28800
+            self.eight_hour_readings = [r for r in self.eight_hour_readings if r['timestamp'] >= cutoff_8hr]
+        
+        # Calculate time-weighted averages (Leq)
+        reading['one_min_avg'] = self.calculate_leq(self.one_min_readings)
+        reading['one_hour_avg'] = self.calculate_leq(self.one_hour_readings)
+        reading['eight_hour_avg'] = self.calculate_leq(self.eight_hour_readings)
+        
+        # Update peaks
+        if self.peak_1min_reset_time is None or timestamp >= self.peak_1min_reset_time + 60:
+            # Reset 1-minute peak
+            self.peak_1min = spl
+            self.peak_1min_reset_time = timestamp
+        else:
+            self.peak_1min = max(self.peak_1min, spl)
+        
+        self.peak_all = max(self.peak_all, spl)
+        
+        # Round values for display
+        reading['one_min_avg'] = round(reading['one_min_avg'], 1)
+        reading['one_hour_avg'] = round(reading['one_hour_avg'], 1)
+        reading['eight_hour_avg'] = round(reading['eight_hour_avg'], 1)
+        reading['peak'] = round(self.peak_1min, 1)
+        
+        # Limit history
+        if len(self.readings) > 300:  # 5 minutes at ~10 readings/sec
+            self.readings.pop(0)
+        
+        return reading
+    
+    def calculate_leq(self, readings):
+        """
+        Calculate Leq (Equivalent Continuous Sound Level) for a set of readings.
+        
+        Leq = 10 * log10( (1/n) * sum(10^(Li/10)) )
+        
+        Args:
+            readings: List of reading dictionaries
+            
+        Returns:
+            float: Leq value in dB
+        """
+        if not readings:
+            return 0.0
+        
+        sum_energy = sum(10 ** (r['instant'] / 10) for r in readings)
+        avg_energy = sum_energy / len(readings)
+        leq = 10 * math.log10(avg_energy) if avg_energy > 0 else 0.0
+        
+        return leq if math.isfinite(leq) else 0.0
+    
+    def get_latest_reading(self):
+        """Get the most recent complete reading."""
+        if self.readings:
+            return self.readings[-1]
+        return None
+    
+    def get_stats(self):
+        """Get current statistics for display."""
+        latest = self.get_latest_reading()
+        if not latest:
+            return {
+                'instant': 0.0,
+                'one_min_avg': 0.0,
+                'one_hour_avg': 0.0,
+                'eight_hour_avg': 0.0,
+                'peak_1min': 0.0,
+                'peak_all': 0.0
+            }
+        
+        return {
+            'instant': latest['instant'],
+            'one_min_avg': latest['one_min_avg'],
+            'one_hour_avg': latest['one_hour_avg'],
+            'eight_hour_avg': latest['eight_hour_avg'],
+            'peak_1min': self.peak_1min if self.peak_1min != -float('inf') else 0.0,
+            'peak_all': self.peak_all if self.peak_all != -float('inf') else 0.0
+        }
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Threaded HTTP server to handle multiple requests."""
+    allow_reuse_address = True
+
+
+class QuietHTTPHandler(SimpleHTTPRequestHandler):
+    """HTTP handler that doesn't log requests."""
+    
+    def log_message(self, format, *args):
+        pass
+    
+    def do_GET(self):
+        """Serve files, with special handling for root path."""
+        if self.path == '/' or self.path == '/index.html':
+            # Serve the display HTML
+            self.path = '/spl_display.html'
+        return SimpleHTTPRequestHandler.do_GET(self)
+
+
+async def websocket_handler(websocket, path, data_manager):
+    """
+    WebSocket handler that streams SPL data to connected clients.
+    
+    Args:
+        websocket: WebSocket connection
+        path: Request path
+        data_manager: SPLDataManager instance
+    """
+    print(f"WebSocket client connected from {websocket.remote_address}")
+    
+    try:
+        # Send initial stats
+        stats = data_manager.get_stats()
+        stats['type'] = 'stats'
+        await websocket.send(json.dumps(stats))
+        
+        # Keep connection open and send updates
+        while True:
+            latest = data_manager.get_latest_reading()
+            if latest:
+                # Format timestamp for display
+                timestamp_str = time.strftime('%H:%M:%S', time.localtime(latest['timestamp']))
+                
+                message = {
+                    'type': 'reading',
+                    'timestamp': timestamp_str,
+                    'instant': latest['instant'],
+                    'one_min_avg': latest['one_min_avg'],
+                    'one_hour_avg': latest['one_hour_avg'],
+                    'eight_hour_avg': latest['eight_hour_avg'],
+                    'peak': latest['peak'],
+                    'stats': data_manager.get_stats()
+                }
+                await websocket.send(json.dumps(message))
+            
+            # Send updates at ~10 Hz (100ms intervals)
+            await asyncio.sleep(0.1)
+            
+    except websockets.exceptions.ConnectionClosed:
+        print(f"WebSocket client disconnected from {websocket.remote_address}")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+
+async def start_websocket_server(port, data_manager):
+    """
+    Start WebSocket server for real-time data streaming.
+    
+    Args:
+        port: Port to listen on
+        data_manager: SPLDataManager instance
+    """
+    server = await websockets.serve(
+        lambda ws, path: websocket_handler(ws, path, data_manager),
+        'localhost',
+        port + 1  # Use port+1 for WebSocket
+    )
+    print(f"WebSocket server started on ws://localhost:{port + 1}")
+    await server.wait_closed()
+
+
+HTML_DISPLAY = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SPL Meter - Real-time Sound Level Measurement</title>
+    <title>SPL Meter - Display</title>
     <style>
-        \:root {
+        :root {
             --bg-primary: #1a1a2e;
             --bg-secondary: #16213e;
             --bg-card: #0f3460;
@@ -41,13 +376,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             --danger: #ff4444;
             --border: #2a2a4a;
         }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: var(--bg-primary);
@@ -55,17 +384,8 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             min-height: 100vh;
             padding: 20px;
         }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        header {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-
+        .container { max-width: 1400px; margin: 0 auto; }
+        header { text-align: center; margin-bottom: 30px; }
         h1 {
             font-size: 2.5rem;
             margin-bottom: 10px;
@@ -74,123 +394,50 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
-
-        .subtitle {
-            color: var(--text-secondary);
-            font-size: 1.1rem;
-        }
-
-        .controls {
-            display: flex;
-            gap: 15px;
+        .subtitle { color: var(--text-secondary); font-size: 1.1rem; }
+        .status-bar {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 15px 20px;
+            border: 1px solid var(--border);
             margin-bottom: 25px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        .control-group {
             display: flex;
-            gap: 10px;
+            justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
+            gap: 15px;
         }
-
-        select, button {
-            padding: 12px 20px;
-            border: none;
-            border-radius: 8px;
-            font-size: 1rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        select {
-            background: var(--bg-card);
-            color: var(--text-primary);
-            border: 1px solid var(--border);
-            min-width: 250px;
-        }
-
-        select\:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 2px var(--accent-glow);
-        }
-
-        button {
-            background: var(--bg-card);
-            color: var(--text-primary);
-            border: 1px solid var(--border);
+        .status-indicator {
+            padding: 8px 16px;
+            border-radius: 20px;
             font-weight: 600;
+            font-size: 0.9rem;
         }
-
-        button\:hover {
-            background: var(--accent);
-            border-color: var(--accent);
-            transform: translateY(-2px);
-        }
-
-        button\:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        button.stop {
-            background: var(--danger);
-            border-color: var(--danger);
-        }
-
-        button.stop\:hover {
-            background: #ff6666;
-            border-color: #ff6666;
-        }
-
-        .status {
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 600;
-            margin-left: auto;
-        }
-
-        .status.connected {
+        .status-connected {
             background: rgba(78, 204, 163, 0.2);
             border: 1px solid var(--success);
             color: var(--success);
         }
-
-        .status.disconnected {
+        .status-disconnected {
             background: rgba(255, 68, 68, 0.2);
             border: 1px solid var(--danger);
             color: var(--danger);
         }
-
-        .status.error {
-            background: rgba(255, 68, 68, 0.2);
-            border: 1px solid var(--danger);
-            color: var(--danger);
-        }
-
         .meter-container {
             display: grid;
             grid-template-columns: 1fr 2fr;
             gap: 25px;
             margin-bottom: 25px;
         }
-
         @media (max-width: 1000px) {
-            .meter-container {
-                grid-template-columns: 1fr;
-            }
+            .meter-container { grid-template-columns: 1fr; }
         }
-
         .current-reading {
             background: var(--bg-card);
             border-radius: 12px;
             padding: 25px;
             border: 1px solid var(--border);
         }
-
         .current-value {
             font-size: 4rem;
             font-weight: 700;
@@ -201,20 +448,17 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
-
         .current-label {
             text-align: center;
             color: var(--text-secondary);
             font-size: 1.1rem;
             margin-bottom: 10px;
         }
-
         .current-timestamp {
             text-align: center;
             color: var(--text-secondary);
             font-size: 0.9rem;
         }
-
         .gauge {
             width: 100%;
             height: 20px;
@@ -224,25 +468,20 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             margin-top: 20px;
             position: relative;
         }
-
         .gauge-fill {
             height: 100%;
             border-radius: 10px;
-            transition: width 0.3s ease;
+            transition: width 0.3s ease, background 0.3s ease;
             position: relative;
         }
-
         .gauge-fill::after {
             content: '';
             position: absolute;
-            top: 0;
-            right: 0;
-            width: 4px;
-            height: 100%;
+            top: 0; right: 0;
+            width: 4px; height: 100%;
             background: rgba(255, 255, 255, 0.5);
             border-radius: 0 10px 10px 0;
         }
-
         .gauge-labels {
             display: flex;
             justify-content: space-between;
@@ -250,27 +489,61 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             font-size: 0.75rem;
             color: var(--text-secondary);
         }
-
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .stat-card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid var(--border);
+        }
+        .stat-card h3 {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        .stat-card .label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 5px;
+        }
+        .chart-container {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 25px;
+            border: 1px solid var(--border);
+            margin-bottom: 25px;
+        }
+        #splChart {
+            width: 100%;
+            height: 300px;
+        }
         .data-table-container {
             background: var(--bg-card);
             border-radius: 12px;
             padding: 25px;
             border: 1px solid var(--border);
             overflow-x: auto;
+            margin-bottom: 25px;
         }
-
         .data-table {
             width: 100%;
             border-collapse: collapse;
         }
-
-        .data-table th,
-        .data-table td {
+        .data-table th, .data-table td {
             padding: 12px 15px;
             text-align: left;
             border-bottom: 1px solid var(--border);
         }
-
         .data-table th {
             background: var(--bg-secondary);
             color: var(--text-secondary);
@@ -279,17 +552,12 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             text-transform: uppercase;
             letter-spacing: 1px;
         }
-
-        .data-table tr\:hover {
-            background: rgba(255, 255, 255, 0.05);
-        }
-
+        .data-table tr:hover { background: rgba(255, 255, 255, 0.05); }
         .value-instant { color: var(--accent); font-weight: 600; }
         .value-1min { color: var(--success); font-weight: 600; }
         .value-1hr { color: #4a90e2; font-weight: 600; }
         .value-8hr { color: #9b59b6; font-weight: 600; }
         .value-peak { color: var(--warning); font-weight: 600; }
-
         .calibration-info {
             background: var(--bg-secondary);
             border-radius: 8px;
@@ -298,87 +566,15 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             border-left: 4px solid var(--warning);
             font-size: 0.9rem;
         }
-
         .calibration-info h3 {
             margin-bottom: 10px;
             color: var(--warning);
             font-size: 1rem;
         }
-
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-bottom: 25px;
-        }
-
-        .stat-card {
-            background: var(--bg-card);
-            border-radius: 12px;
-            padding: 20px;
-            border: 1px solid var(--border);
-        }
-
-        .stat-card h3 {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 10px;
-        }
-
-        .stat-card .value {
-            font-size: 2rem;
-            font-weight: 700;
-        }
-
-        .stat-card .label {
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-            margin-top: 5px;
-        }
-
-        .chart-container {
-            background: var(--bg-card);
-            border-radius: 12px;
-            padding: 25px;
-            border: 1px solid var(--border);
-            margin-bottom: 25px;
-        }
-
-        #splChart {
-            width: 100%;
-            height: 300px;
-        }
-
-        .info-badge {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-        }
-
-        .badge-umik {
-            background: rgba(155, 89, 182, 0.2);
-            border: 1px solid #9b59b6;
-            color: #9b59b6;
-        }
-
-        .badge-builtin {
-            background: rgba(74, 144, 226, 0.2);
-            border: 1px solid #4a90e2;
-            color: #4a90e2;
-        }
-
         @media (max-width: 768px) {
             h1 { font-size: 1.8rem; }
             .current-value { font-size: 2.5rem; }
-            .controls { flex-direction: column; align-items: stretch; }
-            .control-group { flex-direction: column; align-items: stretch; }
-            select { width: 100%; }
-            .status { margin-left: 0; text-align: center; }
+            .meter-container { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -388,18 +584,14 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
             <h1>SPL Meter</h1>
             <p class="subtitle">Real-time Sound Pressure Level Measurement</p>
         </header>
-
-        <div class="controls">
-            <div class="control-group">
-                <select id="micSelect">
-                    <option value="">Select Microphone...</option>
-                </select>
-                <button id="startBtn">Start Measurement</button>
-                <button id="stopBtn" class="stop" disabled>Stop Measurement</button>
+        
+        <div class="status-bar">
+            <div class="status-indicator status-disconnected" id="status">
+                Connecting to server...
             </div>
-            <div class="status disconnected" id="status">Disconnected</div>
+            <div id="micInfo">Microphone: Not selected</div>
         </div>
-
+        
         <div class="meter-container">
             <div class="current-reading">
                 <div class="current-label">Current SPL</div>
@@ -415,7 +607,7 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
                     <span>120 dB</span>
                 </div>
             </div>
-
+            
             <div class="stats-grid">
                 <div class="stat-card">
                     <h3>Instant</h3>
@@ -449,12 +641,12 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
                 </div>
             </div>
         </div>
-
+        
         <div class="chart-container">
             <h2>SPL History (Last 5 minutes)</h2>
             <canvas id="splChart"></canvas>
         </div>
-
+        
         <div class="data-table-container">
             <h2>Recent Readings</h2>
             <table class="data-table" id="readingsTable">
@@ -469,57 +661,33 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
                     </tr>
                 </thead>
                 <tbody id="readingsBody">
-                    <tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No data yet. Start measurement to see readings.</td></tr>
+                    <tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">Connecting to server...</td></tr>
                 </tbody>
             </table>
         </div>
-
+        
         <div class="calibration-info">
-            <h3>⚠️ Calibration Notice</h3>
-            <p><strong>UMIK-1:</strong> For accurate measurements with the UMIK-1, ensure it's selected as the input device. The UMIK-1 has a flat frequency response and comes with calibration data. This app uses a standard reference; for professional use, apply the UMIK-1's calibration file.</p>
-            <p><strong>Built-in Mic:</strong> MacBook microphones are not calibrated for SPL measurement. Readings will be relative and may not reflect true acoustic SPL values.</p>
-            <p><strong>Reference:</strong> This meter uses 20 μPa (0 dB SPL = 0.00002 Pa) as the reference pressure.</p>
+            <h3>ℹ️ About This Version</h3>
+            <p><strong>Python Backend:</strong> All audio capture and SPL calculations are performed by the Python server using PyAudio. This provides more accurate measurements than browser-based Web Audio API.</p>
+            <p><strong>Display Only:</strong> This HTML page is just a visual interface that connects to the Python server via WebSocket and displays the real-time data.</p>
+            <p><strong>No Browser Permissions:</strong> Since audio is captured by Python, you don't need to grant microphone permissions to your browser.</p>
         </div>
     </div>
-
+    
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
-        const CONFIG = {
-            fftSize: 2048,
-            smoothingTimeConstant: 0.8,
-            updateInterval: 100,
-            maxHistory: 300,
-            maxChartPoints: 300,
-            calibration: {
-                umik1: { offset: 128, label: 'UMIK-1' },
-                default: { offset: 94, label: 'Default' }
-            }
-        };
-
-        let audioContext;
-        let analyser;
-        let microphone;
-        let mediaStream;
-        let rafId;
+        // WebSocket connection
+        let socket;
         let chart;
-        let chartLabels = [];
-        let chartDataInstant = [];
-        let chartData1Min = [];
-        let chartDataPeak = [];
-
-        const readings = [];
-        const oneMinReadings = [];
-        const oneHourReadings = [];
-        const eightHourReadings = [];
-
-        let peak1Min = -Infinity;
-        let peakAll = -Infinity;
-        let peak1MinResetTime = null;
-
-        const micSelect = document.getElementById('micSelect');
-        const startBtn = document.getElementById('startBtn');
-        const stopBtn = document.getElementById('stopBtn');
+        const chartLabels = [];
+        const chartDataInstant = [];
+        const chartData1Min = [];
+        const chartDataPeak = [];
+        const MAX_CHART_POINTS = 300;
+        
+        // DOM Elements
         const statusEl = document.getElementById('status');
+        const micInfoEl = document.getElementById('micInfo');
         const currentSplEl = document.getElementById('currentSpl');
         const currentTimestampEl = document.getElementById('currentTimestamp');
         const gaugeFillEl = document.getElementById('gaugeFill');
@@ -530,65 +698,54 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
         const statPeak1MinEl = document.getElementById('statPeak1Min');
         const statPeakAllEl = document.getElementById('statPeakAll');
         const readingsBodyEl = document.getElementById('readingsBody');
-
-        async function init() {
-            try {
-                await loadMicrophones();
-                initChart();
-                setupEventListeners();
-                console.log('SPL Meter initialized successfully');
-            } catch (err) {
-                console.error('Initialization error:', err);
-                statusEl.textContent = 'Initialization Error';
-                statusEl.className = 'status error';
-            }
-        }
-
-        async function loadMicrophones() {
-            try {
-                const devices = await navigator.mediaDevices.enumerateDevices();
-                const mics = devices.filter(d => d.kind === 'audioinput');
-
-                micSelect.innerHTML = '<option value="">Select Microphone...</option>';
-
-                if (mics.length === 0) {
-                    const option = document.createElement('option');
-                    option.value = '';
-                    option.textContent = 'No microphones found';
-                    option.disabled = true;
-                    micSelect.appendChild(option);
-                    return;
+        
+        // Connect to WebSocket
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.hostname;
+            const port = parseInt(window.location.port) + 1;
+            const wsUrl = `${protocol}//${host}:${port}`;
+            
+            console.log(`Connecting to WebSocket at ${wsUrl}`);
+            
+            socket = new WebSocket(wsUrl);
+            
+            socket.onopen = () => {
+                console.log('WebSocket connected');
+                statusEl.textContent = 'Connected';
+                statusEl.className = 'status-indicator status-connected';
+            };
+            
+            socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'stats') {
+                    // Initial stats
+                    updateStats(data);
+                } else if (data.type === 'reading') {
+                    // New reading
+                    updateDisplay(data);
                 }
-
-                mics.forEach(mic => {
-                    const option = document.createElement('option');
-                    option.value = mic.deviceId;
-                    option.textContent = mic.label || `Microphone ${micSelect.length + 1}`;
-
-                    if (mic.label && mic.label.toLowerCase().includes('umik')) {
-                        option.innerHTML = `${mic.label} <span class="info-badge badge-umik">UMIK</span>`;
-                    } else if (mic.label && (mic.label.toLowerCase().includes('builtin') || mic.label.toLowerCase().includes('macbook'))) {
-                        option.innerHTML = `${mic.label} <span class="info-badge badge-builtin">Built-in</span>`;
-                    }
-
-                    micSelect.appendChild(option);
-                });
-
-                micSelect.disabled = false;
-            } catch (err) {
-                console.error('Error loading microphones:', err);
-                const option = document.createElement('option');
-                option.value = '';
-                option.textContent = 'Error loading microphones';
-                option.disabled = true;
-                micSelect.appendChild(option);
-                throw err;
-            }
+            };
+            
+            socket.onclose = () => {
+                console.log('WebSocket disconnected');
+                statusEl.textContent = 'Disconnected';
+                statusEl.className = 'status-indicator status-disconnected';
+                // Try to reconnect
+                setTimeout(connectWebSocket, 5000);
+            };
+            
+            socket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                statusEl.textContent = 'Connection Error';
+                statusEl.className = 'status-indicator status-disconnected';
+            };
         }
-
+        
+        // Initialize Chart
         function initChart() {
             const ctx = document.getElementById('splChart').getContext('2d');
-
             chart = new Chart(ctx, {
                 type: 'line',
                 data: {
@@ -626,419 +783,250 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    interaction: { intersect: false, mode: 'index' },
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
                     scales: {
                         y: {
                             beginAtZero: true,
                             min: 0,
                             max: 120,
-                            title: { display: true, text: 'SPL (dB)' },
+                            title: {
+                                display: true,
+                                text: 'SPL (dB)'
+                            },
                             ticks: { color: '#a0a0a0' },
                             grid: { color: 'rgba(255, 255, 255, 0.1)' }
                         },
                         x: {
-                            title: { display: true, text: 'Time' },
-                            ticks: { color: '#a0a0a0', maxTicksLimit: 10 },
-                            grid: { color: 'rgba(255, 255, 255, 0.1)' }
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            },
+                            ticks: {
+                                color: '#a0a0a0',
+                                maxTicksLimit: 10
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            }
                         }
                     },
                     plugins: {
-                        legend: { labels: { color: '#eaeaea' } },
+                        legend: {
+                            labels: { color: '#eaeaea' }
+                        },
                         tooltip: {
                             callbacks: {
-                                label: function(context) {
-                                    return `${context.dataset.label}: ${context.raw} dB`;
-                                }
+                                label: (context) => `${context.dataset.label}: ${context.raw} dB`
                             }
                         }
                     }
                 }
             });
         }
-
-        function setupEventListeners() {
-            startBtn.addEventListener('click', startMeasurement);
-            stopBtn.addEventListener('click', stopMeasurement);
-        }
-
-        async function startMeasurement() {
-            if (!micSelect.value) {
-                alert('Please select a microphone first.');
-                return;
-            }
-
-            try {
-                stopMeasurement();
-
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-
-                mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        deviceId: { exact: micSelect.value },
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false
-                    }
-                });
-
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = CONFIG.fftSize;
-                analyser.smoothingTimeConstant = CONFIG.smoothingTimeConstant;
-
-                microphone = audioContext.createMediaStreamSource(mediaStream);
-                microphone.connect(analyser);
-
-                startProcessing();
-
-                startBtn.disabled = true;
-                stopBtn.disabled = false;
-                statusEl.textContent = 'Measuring...';
-                statusEl.className = 'status connected';
-
-                console.log('Measurement started successfully');
-            } catch (err) {
-                console.error('Error starting measurement:', err);
-                statusEl.textContent = `Error: ${err.message}`;
-                statusEl.className = 'status error';
-                startBtn.disabled = false;
-                stopBtn.disabled = true;
-
-                let errorMsg = 'Error starting measurement';
-                if (err.name === 'NotAllowedError') {
-                    errorMsg = 'Microphone access denied. Please grant microphone permissions.';
-                } else if (err.name === 'NotFoundError') {
-                    errorMsg = 'No microphone found. Please connect a microphone.';
-                } else if (err.message.includes('deviceId')) {
-                    errorMsg = 'Selected microphone not available. Please try another.';
-                }
-                alert(errorMsg);
-            }
-        }
-
-        function stopMeasurement() {
-            if (rafId) {
-                cancelAnimationFrame(rafId);
-                rafId = null;
-            }
-
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(track => {
-                    try { track.stop(); } catch (e) { console.warn('Error stopping track:', e); }
-                });
-                mediaStream = null;
-            }
-
-            if (audioContext) {
-                audioContext.close().catch(e => { console.warn('Error closing audio context:', e); });
-                audioContext = null;
-            }
-
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
-            statusEl.textContent = 'Stopped';
-            statusEl.className = 'status disconnected';
-            console.log('Measurement stopped');
-        }
-
-        function startProcessing() {
-            const timeDomainData = new Uint8Array(analyser.frequencyBinCount);
-            let lastUpdate = 0;
-
-            function processFrame(timestamp) {
-                if (!audioContext || audioContext.state === 'closed') return;
-
-                try {
-                    analyser.getByteTimeDomainData(timeDomainData);
-                    const spl = calculateSPL(timeDomainData);
-                    const now = new Date();
-
-                    if (timestamp - lastUpdate >= CONFIG.updateInterval) {
-                        updateReadings(spl, now);
-                        lastUpdate = timestamp;
-                    }
-
-                    rafId = requestAnimationFrame(processFrame);
-                } catch (err) {
-                    console.error('Error in processFrame:', err);
-                    stopMeasurement();
-                    statusEl.textContent = 'Error processing audio';
-                    statusEl.className = 'status error';
-                    startBtn.disabled = false;
-                }
-            }
-
-            rafId = requestAnimationFrame(processFrame);
-        }
-
-        function calculateSPL(timeDomainData) {
-            const floatData = new Float32Array(timeDomainData.length);
-            for (let i = 0; i < timeDomainData.length; i++) {
-                floatData[i] = (timeDomainData[i] - 128) / 128.0;
-            }
-
-            let sumSquares = 0;
-            for (let i = 0; i < floatData.length; i++) {
-                sumSquares += floatData[i] * floatData[i];
-            }
-            const meanSquares = sumSquares / floatData.length;
-            const rms = Math.sqrt(meanSquares);
-
-            let dbfs;
-            if (rms > 0) {
-                dbfs = 20 * Math.log10(rms);
-            } else {
-                dbfs = -Infinity;
-            }
-
-            const selectedMic = micSelect.options[micSelect.selectedIndex];
-            const isUmik = selectedMic && selectedMic.textContent.toLowerCase().includes('umik');
-            const calibrationOffset = isUmik ? CONFIG.calibration.umik1.offset : CONFIG.calibration.default.offset;
-            let spl = dbfs + calibrationOffset;
-            spl = Math.max(0, Math.min(140, spl));
-            spl = applyAWeighting(spl);
-            return Math.round(spl * 10) / 10;
-        }
-
-        function applyAWeighting(spl) {
-            return spl - 2;
-        }
-
-        function updateReadings(spl, timestamp) {
-            const reading = {
-                timestamp: timestamp,
-                instant: spl,
-                oneMinAvg: null,
-                oneHrAvg: null,
-                eightHrAvg: null,
-                peak: spl
-            };
-
-            readings.push(reading);
-            oneMinReadings.push(reading);
-            oneHourReadings.push(reading);
-            eightHourReadings.push(reading);
-
-            const oneMinAgo = new Date(timestamp.getTime() - 60 * 1000);
-            const oneHrAgo = new Date(timestamp.getTime() - 60 * 60 * 1000);
-            const eightHrAgo = new Date(timestamp.getTime() - 8 * 60 * 60 * 1000);
-
-            const oneMinIndex = oneMinReadings.findIndex(r => r.timestamp >= oneMinAgo);
-            if (oneMinIndex > 0) oneMinReadings.splice(0, oneMinIndex);
-
-            if (readings.length % 10 === 0) {
-                const oneHrIndex = oneHourReadings.findIndex(r => r.timestamp >= oneHrAgo);
-                if (oneHrIndex > 0) oneHourReadings.splice(0, oneHrIndex);
-            }
-
-            if (readings.length % 60 === 0) {
-                const eightHrIndex = eightHourReadings.findIndex(r => r.timestamp >= eightHrAgo);
-                if (eightHrIndex > 0) eightHourReadings.splice(0, eightHrIndex);
-            }
-
-            reading.oneMinAvg = calculateLeq(oneMinReadings);
-            reading.oneHrAvg = calculateLeq(oneHourReadings);
-            reading.eightHrAvg = calculateLeq(eightHourReadings);
-
-            if (!peak1MinResetTime || timestamp >= peak1MinResetTime) {
-                if (!peak1MinResetTime || timestamp >= new Date(peak1MinResetTime.getTime() + 60 * 1000)) {
-                    peak1Min = spl;
-                    peak1MinResetTime = timestamp;
-                } else {
-                    peak1Min = Math.max(peak1Min, spl);
-                }
-            } else {
-                peak1Min = Math.max(peak1Min, spl);
-            }
-            peakAll = Math.max(peakAll, spl);
-
-            reading.oneMinAvg = Math.round(reading.oneMinAvg * 10) / 10;
-            reading.oneHrAvg = Math.round(reading.oneHrAvg * 10) / 10;
-            reading.eightHrAvg = Math.round(reading.eightHrAvg * 10) / 10;
-            reading.peak = Math.round(peak1Min * 10) / 10;
-
-            if (readings.length > CONFIG.maxHistory) readings.shift();
-            updateUI(reading);
-            updateChart(reading);
-        }
-
-        function calculateLeq(readingsArray) {
-            if (readingsArray.length === 0) return 0;
-            let sumEnergy = 0;
-            for (const r of readingsArray) {
-                sumEnergy += Math.pow(10, r.instant / 10);
-            }
-            const avgEnergy = sumEnergy / readingsArray.length;
-            const leq = 10 * Math.log10(avgEnergy);
-            return isFinite(leq) ? leq : 0;
-        }
-
-        function updateUI(reading) {
-            const timeStr = reading.timestamp.toLocaleTimeString('en-GB', {
-                hour: '2-digit', minute: '2-digit', second: '2-digit'
-            });
-
-            currentSplEl.textContent = `${reading.instant} dB`;
-            currentTimestampEl.textContent = timeStr;
-
-            const gaugePercent = Math.min(100, Math.max(0, reading.instant * 1.2));
+        
+        // Update display with new data
+        function updateDisplay(data) {
+            // Update timestamp
+            currentTimestampEl.textContent = data.timestamp;
+            
+            // Update current SPL
+            currentSplEl.textContent = `${data.instant} dB`;
+            
+            // Update gauge
+            const gaugePercent = Math.min(100, Math.max(0, data.instant * 1.2));
             gaugeFillEl.style.width = `${gaugePercent}%`;
-
-            if (reading.instant > 100) {
+            
+            // Update gauge color
+            if (data.instant > 100) {
                 gaugeFillEl.style.background = 'var(--danger)';
-            } else if (reading.instant > 80) {
+            } else if (data.instant > 80) {
                 gaugeFillEl.style.background = 'var(--warning)';
-            } else if (reading.instant > 60) {
+            } else if (data.instant > 60) {
                 gaugeFillEl.style.background = 'var(--success)';
             } else {
                 gaugeFillEl.style.background = 'var(--accent)';
             }
-
-            statInstantEl.textContent = `${reading.instant} dB`;
-            stat1MinEl.textContent = `${reading.oneMinAvg} dB`;
-            stat1HrEl.textContent = `${reading.oneHrAvg} dB`;
-            stat8HrEl.textContent = `${reading.eightHrAvg} dB`;
-            statPeak1MinEl.textContent = `${Math.round(peak1Min * 10) / 10} dB`;
-            statPeakAllEl.textContent = `${Math.round(peakAll * 10) / 10} dB`;
-
-            updateTable(reading, timeStr);
+            
+            // Update stats
+            updateStats(data.stats);
+            
+            // Update chart
+            updateChart(data);
+            
+            // Update table
+            updateTable(data);
         }
-
-        function updateTable(reading, timeStr) {
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td>${timeStr}</td>
-                <td class="value-instant">${reading.instant} dB</td>
-                <td class="value-1min">${reading.oneMinAvg} dB</td>
-                <td class="value-1hr">${reading.oneHrAvg} dB</td>
-                <td class="value-8hr">${reading.eightHrAvg} dB</td>
-                <td class="value-peak">${reading.peak} dB</td>
-            `;
-
-            readingsBodyEl.insertBefore(row, readingsBodyEl.firstChild);
-            while (readingsBodyEl.children.length > 50) {
-                readingsBodyEl.removeChild(readingsBodyEl.lastChild);
-            }
-
-            const noDataRow = readingsBodyEl.querySelector('tr td[colspan="6"]');
-            if (noDataRow) noDataRow.parentElement.remove();
+        
+        function updateStats(stats) {
+            statInstantEl.textContent = `${stats.instant} dB`;
+            stat1MinEl.textContent = `${stats.one_min_avg} dB`;
+            stat1HrEl.textContent = `${stats.one_hour_avg} dB`;
+            stat8HrEl.textContent = `${stats.eight_hour_avg} dB`;
+            statPeak1MinEl.textContent = `${stats.peak_1min} dB`;
+            statPeakAllEl.textContent = `${stats.peak_all} dB`;
         }
-
-        function updateChart(reading) {
-            const timeStr = reading.timestamp.toLocaleTimeString('en-GB', {
-                hour: '2-digit', minute: '2-digit', second: '2-digit'
-            });
-
-            chartLabels.push(timeStr);
-            chartDataInstant.push(reading.instant);
-            chartData1Min.push(reading.oneMinAvg);
-            chartDataPeak.push(peak1Min);
-
-            const maxPoints = CONFIG.maxChartPoints;
-            if (chartLabels.length > maxPoints) {
+        
+        function updateChart(data) {
+            chartLabels.push(data.timestamp);
+            chartDataInstant.push(data.instant);
+            chartData1Min.push(data.one_min_avg);
+            chartDataPeak.push(data.peak);
+            
+            // Limit data points
+            if (chartLabels.length > MAX_CHART_POINTS) {
                 chartLabels.shift();
                 chartDataInstant.shift();
                 chartData1Min.shift();
                 chartDataPeak.shift();
             }
-
+            
             chart.data.labels = chartLabels;
             chart.data.datasets[0].data = chartDataInstant;
             chart.data.datasets[1].data = chartData1Min;
             chart.data.datasets[2].data = chartDataPeak;
             chart.update('none');
         }
-
-        document.addEventListener('DOMContentLoaded', init);
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden && !stopBtn.disabled) {}
+        
+        function updateTable(data) {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${data.timestamp}</td>
+                <td class="value-instant">${data.instant} dB</td>
+                <td class="value-1min">${data.one_min_avg} dB</td>
+                <td class="value-1hr">${data.one_hour_avg} dB</td>
+                <td class="value-8hr">${data.eight_hour_avg} dB</td>
+                <td class="value-peak">${data.peak} dB</td>
+            `;
+            
+            readingsBodyEl.insertBefore(row, readingsBodyEl.firstChild);
+            
+            // Remove old rows
+            while (readingsBodyEl.children.length > 50) {
+                readingsBodyEl.removeChild(readingsBodyEl.lastChild);
+            }
+            
+            // Remove placeholder row
+            const placeholder = readingsBodyEl.querySelector('tr td[colspan="6"]');
+            if (placeholder) {
+                placeholder.parentElement.remove();
+            }
+        }
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            initChart();
+            connectWebSocket();
         });
-        window.addEventListener('beforeunload', () => { stopMeasurement(); });
+        
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (socket) {
+                socket.close();
+            }
+        });
     </script>
 </body>
-</html>'''
+</html>"""
 
-def generate_html(output_file: str = "spl_meter.html") -> Path:
-    """
-    Generate the SPL Meter HTML file.
-
-    Args:
-        output_file: Path to save the HTML file
-
-    Returns:
-        Path to the generated file
-    """
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(HTML_TEMPLATE)
-
-    return output_path
-
-class QuietHandler(SimpleHTTPRequestHandler):
-    """HTTP request handler that doesn't log requests."""
-    def log_message(self, format, *args):
-        pass
-
-def serve_html(port: int = 8000, directory: str = "."):
-    """
-    Start a local HTTP server to serve the generated HTML file.
-
-    Args:
-        port: Port to serve on
-        directory: Directory to serve from
-    """
-    os.chdir(directory)
-
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, QuietHandler)
-
-    print(f"\n{'='*60}")
-    print(f"SPL Meter is now running locally!")
-    print(f"{'='*60}")
-    print(f"URL: http://localhost:{port}/spl_meter.html")
-    print(f"{'='*60}")
-    print("Press Ctrl+C to stop the server\n")
-
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nServer stopped.")
-    finally:
-        httpd.server_close()
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate and optionally serve the SPL Meter web app locally.',
+        description='SPL Meter - Python Backend Server',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python generate_spl_meter.py                     # Generate HTML file
-  python generate_spl_meter.py --serve            # Generate and serve
-  python generate_spl_meter.py --port 8080        # Serve on port 8080
-  python generate_spl_meter.py --output my_app.html  # Custom filename
+  python spl_meter_server.py              # Default: port 8000
+  python spl_meter_server.py --port 8080 # Custom port
+  python spl_meter_server.py --mic umik1  # Use UMIK-1 calibration
         """
     )
-
-    parser.add_argument('--serve', '-s', action='store_true',
-                        help='Start a local HTTP server after generating the file')
-    parser.add_argument('--port', '-p', type=int, default=8000,
-                        help='Port for the HTTP server (default: 8000)')
-    parser.add_argument('--output', '-o', type=str, default='spl_meter.html',
-                        help='Output HTML filename (default: spl_meter.html)')
-
+    
+    parser.add_argument(
+        '--port', '-p',
+        type=int,
+        default=8000,
+        help='HTTP server port (default: 8000)'
+    )
+    
+    parser.add_argument(
+        '--mic', '-m',
+        type=str,
+        default='default',
+        choices=['umik1', 'default', 'builtin'],
+        help='Microphone type for calibration (default: default)'
+    )
+    
+    parser.add_argument(
+        '--html-output',
+        type=str,
+        default='spl_display.html',
+        help='HTML display file to generate (default: spl_display.html)'
+    )
+    
     args = parser.parse_args()
+    
+    # Generate HTML display file
+    html_path = Path(args.html_output)
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(HTML_DISPLAY)
+    print(f"Generated display HTML: {html_path}")
+    
+    # Initialize SPL components
+    spl_calculator = SPLCalculator(mic_type=args.mic)
+    data_manager = SPLDataManager()
+    
+    print(f"Starting SPL Meter server on port {args.port}")
+    print(f"Using {args.mic} microphone calibration")
+    print(f"Open http://localhost:{args.port} in your browser")
+    print("Press Ctrl+C to stop")
+    print()
+    
+    # Start audio capture
+    spl_calculator.start_audio()
+    
+    # Start HTTP server in a thread
+    http_server = ThreadedHTTPServer(('localhost', args.port), QuietHTTPHandler)
+    http_thread = threading.Thread(target=http_server.serve_forever)
+    http_thread.daemon = True
+    http_thread.start()
+    print(f"HTTP server started on http://localhost:{args.port}")
+    
+    # Start WebSocket server
+    asyncio.get_event_loop().run_until_complete(
+        start_websocket_server(args.port, data_manager)
+    )
+    
+    # Main audio processing loop
+    try:
+        while True:
+            # Read audio data
+            try:
+                audio_data = spl_calculator.stream.read(spl_calculator.CHUNK_SIZE, exception_on_overflow=False)
+                
+                # Calculate SPL
+                reading = spl_calculator.calculate_spl(audio_data)
+                
+                # Store and process reading
+                data_manager.add_reading(reading['instant'], time.time())
+                
+                # Small delay to maintain ~10 Hz update rate
+                time.sleep(0.1)
+                
+            except Exception as e:
+                print(f"Audio error: {e}")
+                time.sleep(1)
+                
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        spl_calculator.stop_audio()
+        http_server.shutdown()
+        print("Server stopped")
 
-    print(f"Generating SPL Meter HTML file: {args.output}")
-    output_path = generate_html(args.output)
-    print(f"✓ File generated: {output_path.absolute()}")
-
-    if args.serve:
-        serve_html(port=args.port)
-    else:
-        print(f"\nTo view the app:")
-        print(f"  1. Open {output_path.absolute()} in your browser")
-        print(f"  2. Or run: python {__file__} --serve")
 
 if __name__ == '__main__':
+    import threading
     main()
