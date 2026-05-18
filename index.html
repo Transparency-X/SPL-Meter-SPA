@@ -142,6 +142,12 @@
             color: var(--danger);
         }
 
+        .status.error {
+            background: rgba(255, 68, 68, 0.2);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+        }
+
         .meter-container {
             display: grid;
             grid-template-columns: 1fr 2fr;
@@ -531,14 +537,10 @@
             smoothingTimeConstant: 0.8,
             updateInterval: 100, // ms
             maxHistory: 300, // 5 minutes at 100ms intervals
+            maxChartPoints: 300, // Max data points on chart
             calibration: {
-                // UMIK-1 sensitivity: -34 dBFS at 94 dB SPL (1 kHz)
-                // This means 94 dB SPL produces -34 dBFS in digital
-                // So: digital dBFS = SPL - 128 (for UMIK-1)
-                // Or: SPL = digital dBFS + 128
-                // But this is approximate; actual calibration varies
                 umik1: { offset: 128, label: 'UMIK-1' },
-                default: { offset: 94, label: 'Default' } // Standard mic approximation
+                default: { offset: 94, label: 'Default' }
             }
         };
 
@@ -550,18 +552,22 @@
         let microphone;
         let mediaStream;
         let rafId;
-        let updateInterval;
         let chart;
+        let chartLabels = [];
+        let chartDataInstant = [];
+        let chartData1Min = [];
+        let chartDataPeak = [];
         
         // Data storage
-        const readings = []; // All readings with timestamps
-        const oneMinReadings = []; // Last 60 seconds
-        const oneHourReadings = []; // Last 60 minutes
-        const eightHourReadings = []; // Last 8 hours
+        const readings = [];
+        const oneMinReadings = [];
+        const oneHourReadings = [];
+        const eightHourReadings = [];
         
         // Peak tracking
         let peak1Min = -Infinity;
         let peakAll = -Infinity;
+        let peak1MinResetTime = null;
         
         // ============================================
         // DOM Elements
@@ -585,9 +591,16 @@
         // Initialization
         // ============================================
         async function init() {
-            await loadMicrophones();
-            initChart();
-            setupEventListeners();
+            try {
+                await loadMicrophones();
+                initChart();
+                setupEventListeners();
+                console.log('SPL Meter initialized successfully');
+            } catch (err) {
+                console.error('Initialization error:', err);
+                statusEl.textContent = 'Initialization Error';
+                statusEl.className = 'status error';
+            }
         }
 
         async function loadMicrophones() {
@@ -597,12 +610,20 @@
                 
                 micSelect.innerHTML = '<option value="">Select Microphone...</option>';
                 
+                if (mics.length === 0) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = 'No microphones found';
+                    option.disabled = true;
+                    micSelect.appendChild(option);
+                    return;
+                }
+                
                 mics.forEach(mic => {
                     const option = document.createElement('option');
                     option.value = mic.deviceId;
                     option.textContent = mic.label || `Microphone ${micSelect.length + 1}`;
                     
-                    // Add badge for known microphones
                     if (mic.label && mic.label.toLowerCase().includes('umik')) {
                         option.innerHTML = `${mic.label} <span class="info-badge badge-umik">UMIK</span>`;
                     } else if (mic.label && (mic.label.toLowerCase().includes('builtin') || mic.label.toLowerCase().includes('macbook'))) {
@@ -612,12 +633,15 @@
                     micSelect.appendChild(option);
                 });
                 
-                if (mics.length > 0) {
-                    micSelect.disabled = false;
-                }
+                micSelect.disabled = false;
             } catch (err) {
                 console.error('Error loading microphones:', err);
-                alert('Error accessing microphones. Please ensure you have granted microphone permissions.');
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = 'Error loading microphones';
+                option.disabled = true;
+                micSelect.appendChild(option);
+                throw err;
             }
         }
 
@@ -627,11 +651,11 @@
             chart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: [],
+                    labels: chartLabels,
                     datasets: [
                         {
                             label: 'Instant SPL',
-                            data: [],
+                            data: chartDataInstant,
                             borderColor: 'rgba(233, 69, 96, 1)',
                             backgroundColor: 'rgba(233, 69, 96, 0.1)',
                             borderWidth: 2,
@@ -640,7 +664,7 @@
                         },
                         {
                             label: '1 Min Average',
-                            data: [],
+                            data: chartData1Min,
                             borderColor: 'rgba(78, 204, 163, 1)',
                             backgroundColor: 'rgba(78, 204, 163, 0.1)',
                             borderWidth: 2,
@@ -648,8 +672,8 @@
                             tension: 0.1
                         },
                         {
-                            label: 'Peak',
-                            data: [],
+                            label: 'Peak (1min)',
+                            data: chartDataPeak,
                             borderColor: 'rgba(255, 193, 7, 1)',
                             backgroundColor: 'rgba(255, 193, 7, 0.1)',
                             borderWidth: 2,
@@ -682,15 +706,13 @@
                             }
                         },
                         x: {
-                            type: 'time',
-                            time: {
-                                unit: 'minute',
-                                displayFormats: {
-                                    minute: 'HH:mm'
-                                }
+                            title: {
+                                display: true,
+                                text: 'Time'
                             },
                             ticks: {
-                                color: '#a0a0a0'
+                                color: '#a0a0a0',
+                                maxTicksLimit: 10
                             },
                             grid: {
                                 color: 'rgba(255, 255, 255, 0.1)'
@@ -701,6 +723,13 @@
                         legend: {
                             labels: {
                                 color: '#eaeaea'
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return `${context.dataset.label}: ${context.raw} dB`;
+                                }
                             }
                         }
                     }
@@ -724,13 +753,7 @@
 
             try {
                 // Clean up any existing streams
-                if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop());
-                }
-                
-                if (audioContext) {
-                    await audioContext.close();
-                }
+                stopMeasurement();
 
                 // Create new audio context
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -763,32 +786,54 @@
                 statusEl.textContent = 'Measuring...';
                 statusEl.className = 'status connected';
                 
+                console.log('Measurement started successfully');
             } catch (err) {
                 console.error('Error starting measurement:', err);
-                alert(`Error starting measurement: ${err.message}`);
+                statusEl.textContent = `Error: ${err.message}`;
+                statusEl.className = 'status error';
+                
+                // Re-enable start button after error
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+                
+                // Show user-friendly error
+                let errorMsg = 'Error starting measurement';
+                if (err.name === 'NotAllowedError') {
+                    errorMsg = 'Microphone access denied. Please grant microphone permissions.';
+                } else if (err.name === 'NotFoundError') {
+                    errorMsg = 'No microphone found. Please connect a microphone.';
+                } else if (err.message.includes('deviceId')) {
+                    errorMsg = 'Selected microphone not available. Please try another.';
+                }
+                alert(errorMsg);
             }
         }
 
         function stopMeasurement() {
+            // Cancel animation frame
             if (rafId) {
                 cancelAnimationFrame(rafId);
                 rafId = null;
             }
-            
-            if (updateInterval) {
-                clearInterval(updateInterval);
-                updateInterval = null;
-            }
 
+            // Stop media stream
             if (mediaStream) {
-                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream.getTracks().forEach(track => {
+                    try {
+                        track.stop();
+                    } catch (e) {
+                        console.warn('Error stopping track:', e);
+                    }
+                });
                 mediaStream = null;
             }
 
+            // Close audio context
             if (audioContext) {
-                audioContext.close().then(() => {
-                    audioContext = null;
+                audioContext.close().catch(e => {
+                    console.warn('Error closing audio context:', e);
                 });
+                audioContext = null;
             }
 
             // Update UI
@@ -796,32 +841,44 @@
             stopBtn.disabled = true;
             statusEl.textContent = 'Stopped';
             statusEl.className = 'status disconnected';
+            
+            console.log('Measurement stopped');
         }
 
         function startProcessing() {
-            const bufferLength = analyser.frequencyBinCount;
-            const dataArray = new Uint8Array(bufferLength);
-            // For SPL, we need time domain data
             const timeDomainData = new Uint8Array(analyser.frequencyBinCount);
 
             let lastUpdate = 0;
             const updateFrequency = CONFIG.updateInterval;
 
             function processFrame(timestamp) {
-                // Get time domain data
-                analyser.getByteTimeDomainData(timeDomainData);
-                
-                // Calculate RMS and SPL
-                const spl = calculateSPL(timeDomainData);
-                const now = new Date();
-                
-                // Update at specified interval
-                if (timestamp - lastUpdate >= updateFrequency) {
-                    updateReadings(spl, now);
-                    lastUpdate = timestamp;
+                if (!audioContext || audioContext.state === 'closed') {
+                    return;
                 }
 
-                rafId = requestAnimationFrame(processFrame);
+                try {
+                    // Get time domain data
+                    analyser.getByteTimeDomainData(timeDomainData);
+                    
+                    // Calculate RMS and SPL
+                    const spl = calculateSPL(timeDomainData);
+                    const now = new Date();
+                    
+                    // Update at specified interval
+                    if (timestamp - lastUpdate >= updateFrequency) {
+                        updateReadings(spl, now);
+                        lastUpdate = timestamp;
+                    }
+
+                    rafId = requestAnimationFrame(processFrame);
+                } catch (err) {
+                    console.error('Error in processFrame:', err);
+                    // Stop processing on error
+                    stopMeasurement();
+                    statusEl.textContent = 'Error processing audio';
+                    statusEl.className = 'status error';
+                    startBtn.disabled = false;
+                }
             }
 
             rafId = requestAnimationFrame(processFrame);
@@ -831,7 +888,6 @@
             // Convert to Float32 for proper calculation
             const floatData = new Float32Array(timeDomainData.length);
             for (let i = 0; i < timeDomainData.length; i++) {
-                // Convert from 0-255 to -1.0 to 1.0
                 floatData[i] = (timeDomainData[i] - 128) / 128.0;
             }
 
@@ -843,18 +899,6 @@
             const meanSquares = sumSquares / floatData.length;
             const rms = Math.sqrt(meanSquares);
 
-            // Convert to dB (relative to full scale)
-            // dBFS = 20 * log10(RMS)
-            // But we want dB SPL
-            
-            // For the UMIK-1: -34 dBFS = 94 dB SPL
-            // So: SPL = dBFS + 128
-            // For other mics, we use a default calibration
-            
-            const selectedMic = micSelect.options[micSelect.selectedIndex];
-            const isUmik = selectedMic && selectedMic.textContent.toLowerCase().includes('umik');
-            const calibrationOffset = isUmik ? CONFIG.calibration.umik1.offset : CONFIG.calibration.default.offset;
-            
             // Calculate dBFS
             let dbfs;
             if (rms > 0) {
@@ -863,28 +907,27 @@
                 dbfs = -Infinity;
             }
             
+            // Get calibration offset based on selected mic
+            const selectedMic = micSelect.options[micSelect.selectedIndex];
+            const isUmik = selectedMic && selectedMic.textContent.toLowerCase().includes('umik');
+            const calibrationOffset = isUmik ? CONFIG.calibration.umik1.offset : CONFIG.calibration.default.offset;
+            
             // Convert to SPL
-            // For UMIK-1: SPL = dBFS + 128
-            // For default: SPL = dBFS + 94 (approximate)
             let spl = dbfs + calibrationOffset;
             
             // Clamp to reasonable range
             spl = Math.max(0, Math.min(140, spl));
             
-            // Apply A-weighting (approximate)
-            spl = applyAWeighting(spl, floatData, audioContext.sampleRate);
+            // Apply A-weighting approximation
+            spl = applyAWeighting(spl);
             
-            return Math.round(spl * 10) / 10; // Round to 1 decimal
+            return Math.round(spl * 10) / 10;
         }
 
-        function applyAWeighting(spl, timeDomainData, sampleRate) {
-            // A-weighting is a frequency-dependent correction
-            // For simplicity, we'll apply an approximate correction
-            // A more accurate implementation would use FFT and apply the A-weighting curve
-            
-            // Simple approximation: subtract a fixed amount based on typical speech/music
-            // This is a placeholder - real A-weighting requires frequency analysis
-            return spl - 2; // Approximate correction
+        function applyAWeighting(spl) {
+            // A-weighting approximation
+            // This is a simplified version - real A-weighting requires FFT
+            return spl - 2;
         }
 
         // ============================================
@@ -914,28 +957,48 @@
             const eightHrAgo = new Date(timestamp.getTime() - 8 * 60 * 60 * 1000);
 
             // Filter one minute readings
-            oneMinReadings.splice(0, oneMinReadings.filter(r => r.timestamp < oneMinAgo).length);
-            
-            // Filter one hour readings (check every 10 seconds to reduce overhead)
-            if (readings.length % 10 === 0) {
-                oneHourReadings.splice(0, oneHourReadings.filter(r => r.timestamp < oneHrAgo).length);
+            const oneMinIndex = oneMinReadings.findIndex(r => r.timestamp >= oneMinAgo);
+            if (oneMinIndex > 0) {
+                oneMinReadings.splice(0, oneMinIndex);
             }
             
-            // Filter eight hour readings (check every minute)
+            // Filter one hour readings (check every 10 readings to reduce overhead)
+            if (readings.length % 10 === 0) {
+                const oneHrIndex = oneHourReadings.findIndex(r => r.timestamp >= oneHrAgo);
+                if (oneHrIndex > 0) {
+                    oneHourReadings.splice(0, oneHrIndex);
+                }
+            }
+            
+            // Filter eight hour readings (check every 60 readings)
             if (readings.length % 60 === 0) {
-                eightHourReadings.splice(0, eightHourReadings.filter(r => r.timestamp < eightHrAgo).length);
+                const eightHrIndex = eightHourReadings.findIndex(r => r.timestamp >= eightHrAgo);
+                if (eightHrIndex > 0) {
+                    eightHourReadings.splice(0, eightHrIndex);
+                }
             }
 
-            // Calculate averages
-            reading.oneMinAvg = calculateAverage(oneMinReadings);
-            reading.oneHrAvg = calculateAverage(oneHourReadings);
-            reading.eightHrAvg = calculateAverage(eightHourReadings);
+            // Calculate averages using energy-based Leq
+            reading.oneMinAvg = calculateLeq(oneMinReadings);
+            reading.oneHrAvg = calculateLeq(oneHourReadings);
+            reading.eightHrAvg = calculateLeq(eightHourReadings);
 
             // Update peaks
-            peak1Min = Math.max(peak1Min, spl);
+            const oneMinAgoForPeak = new Date(timestamp.getTime() - 60 * 1000);
+            if (!peak1MinResetTime || timestamp >= peak1MinResetTime) {
+                // Reset 1-minute peak every minute
+                if (!peak1MinResetTime || timestamp >= new Date(peak1MinResetTime.getTime() + 60 * 1000)) {
+                    peak1Min = spl;
+                    peak1MinResetTime = timestamp;
+                } else {
+                    peak1Min = Math.max(peak1Min, spl);
+                }
+            } else {
+                peak1Min = Math.max(peak1Min, spl);
+            }
             peakAll = Math.max(peakAll, spl);
 
-            // Update the reading with calculated values
+            // Round values
             reading.oneMinAvg = Math.round(reading.oneMinAvg * 10) / 10;
             reading.oneHrAvg = Math.round(reading.oneHrAvg * 10) / 10;
             reading.eightHrAvg = Math.round(reading.eightHrAvg * 10) / 10;
@@ -953,10 +1016,10 @@
             updateChart(reading);
         }
 
-        function calculateAverage(readingsArray) {
+        function calculateLeq(readingsArray) {
             if (readingsArray.length === 0) return 0;
             
-            // Energy average (for Leq - Equivalent Continuous Sound Level)
+            // Energy average for Leq
             // Leq = 10 * log10( (1/n) * sum(10^(Li/10)) )
             let sumEnergy = 0;
             for (const r of readingsArray) {
@@ -1030,12 +1093,10 @@
                 readingsBodyEl.removeChild(readingsBodyEl.lastChild);
             }
 
-            // If we had the "no data" row, remove it
-            if (readingsBodyEl.children.length > 50 || readingsBodyEl.children[0].textContent.includes('No data')) {
-                const noDataRow = readingsBodyEl.querySelector('tr td[colspan="6"]');
-                if (noDataRow) {
-                    noDataRow.parentElement.remove();
-                }
+            // Remove "no data" row if present
+            const noDataRow = readingsBodyEl.querySelector('tr td[colspan="6"]');
+            if (noDataRow) {
+                noDataRow.parentElement.remove();
             }
         }
 
@@ -1046,22 +1107,26 @@
                 second: '2-digit'
             });
 
-            // Add data to chart
-            chart.data.labels.push(reading.timestamp);
-            chart.data.datasets[0].data.push(reading.instant);
-            chart.data.datasets[1].data.push(reading.oneMinAvg);
-            chart.data.datasets[2].data.push(peak1Min);
+            // Add formatted time string as label
+            chartLabels.push(timeStr);
+            chartDataInstant.push(reading.instant);
+            chartData1Min.push(reading.oneMinAvg);
+            chartDataPeak.push(peak1Min);
 
-            // Keep only last 5 minutes of data
-            const fiveMinAgo = new Date(reading.timestamp.getTime() - 5 * 60 * 1000);
-            
-            while (chart.data.labels.length > 0 && chart.data.labels[0] < fiveMinAgo) {
-                chart.data.labels.shift();
-                chart.data.datasets[0].data.shift();
-                chart.data.datasets[1].data.shift();
-                chart.data.datasets[2].data.shift();
+            // Keep only last N points
+            const maxPoints = CONFIG.maxChartPoints;
+            if (chartLabels.length > maxPoints) {
+                chartLabels.shift();
+                chartDataInstant.shift();
+                chartData1Min.shift();
+                chartDataPeak.shift();
             }
 
+            // Update chart data without re-rendering (more efficient)
+            chart.data.labels = chartLabels;
+            chart.data.datasets[0].data = chartDataInstant;
+            chart.data.datasets[1].data = chartData1Min;
+            chart.data.datasets[2].data = chartDataPeak;
             chart.update('none');
         }
 
@@ -1083,11 +1148,9 @@
 
         // Handle page visibility changes
         document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-                // Stop measurement when page is hidden to save resources
-                if (!stopBtn.disabled) {
-                    // Don't actually stop, just pause processing
-                }
+            if (document.hidden && !stopBtn.disabled) {
+                // Optionally pause measurement when page is hidden
+                // stopMeasurement();
             }
         });
 
