@@ -54,7 +54,7 @@ The application uses the **Web Audio API** to capture microphone input and calcu
 ### 🔊 Microphone Support
 
 - ✅ **Automatic device detection** - Lists all available microphones
-- ✅ **UMIK-1 support** with calibration offset
+- ✅ **UMIK-1 support** with calibration offset (+128 dB)
 - ✅ **Built-in microphone** support (MacBook, etc.)
 - ✅ **USB microphone** compatibility
 - ✅ **Device selection** dropdown with visual indicators
@@ -71,7 +71,7 @@ The application uses the **Web Audio API** to capture microphone input and calcu
 
 - ✅ **Web Audio API** for audio processing
 - ✅ **No server required** - Pure client-side application
-- ✅ **No dependencies** (except Chart.js CDN)
+- ✅ **No build step** - Single HTML file
 - ✅ **Clean resource management** - Proper audio context cleanup
 - ✅ **Error handling** for microphone access
 
@@ -81,30 +81,28 @@ The application uses the **Web Audio API** to capture microphone input and calcu
 
 ### Option 1: Direct Use
 
-1. Open `index.html` in a modern browser (Chrome, Edge, Safari, Firefox)
-2. Select your microphone from the dropdown
-3. Click "Start Measurement"
-4. Grant microphone permissions when prompted
-5. View real-time SPL readings!
+1. Download `spl_meter.html`
+2. Open in a modern browser (Chrome, Edge, Safari, Firefox)
+3. Select your microphone
+4. Click "Start Measurement"
+5. Grant microphone permissions
 
-### Option 2: Local Server
+### Option 2: Using Python Generator
 
 ```bash
-# Using Python
-python -m http.server 8000
+# Generate the HTML file
+python generate_spl_meter.py
 
-# Using Node.js
-npx serve
+# Generate and serve locally
+python generate_spl_meter.py --serve
 
-# Using PHP
-php -S localhost:8000
+# Custom output filename and port
+python generate_spl_meter.py --output my_app.html --serve --port 8080
 ```
-
-Then open `http://localhost:8000` in your browser.
 
 ### Option 3: Deploy to Web Server
 
-Simply upload all files to your web server. No server-side processing required.
+Upload `spl_meter.html` to any web server. No server-side processing required.
 
 ---
 
@@ -169,6 +167,66 @@ The app applies an approximate offset of **+94 dB** for standard microphones.
 
 ---
 
+## 📦 Project Structure
+
+```
+spl-meter/
+├── spl_meter.html          # Standalone web app (single file)
+├── generate_spl_meter.py   # Python generator script
+├── README.md               # Project documentation
+└── LICENSE                 # MIT License
+```
+
+---
+
+## 🛠️ Technical Details
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│                    Browser                         │
+├─────────────────────────────────────────────────┤
+│  User Interface (HTML/CSS/JS)                     │
+│  ┌─────────────┐    ┌─────────────────────────┐  │
+│  │   Chart.js  │    │   Web Audio API          │  │
+│  │   Visuals   │    │   ┌─────────────────┐   │  │
+│  └─────────────┘    │   │ AudioContext    │   │  │
+│                     │   │ AnalyserNode     │   │  │
+│                     │   │ MediaStream      │   │  │
+│                     │   └─────────────────┘   │  │
+│                     └─────────────────────────┘  │
+│  ┌─────────────────────────────────────────────┐│
+│  │  SPL Calculation Engine                        ││
+│  │  - RMS calculation                             ││
+│  │  - dB conversion                               ││
+│  │  - A-weighting (approximate)                  ││
+│  │  - Time-weighted averages (Leq)               ││
+│  │  - Peak tracking                               ││
+│  └─────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────┘
+```
+
+### SPL Calculation Method
+
+1. **Capture Audio**: Microphone → MediaStream → AudioContext
+2. **Get Time Domain Data**: `analyser.getByteTimeDomainData()`
+3. **Convert to Float**: Normalize to -1.0 to 1.0 range
+4. **Calculate RMS**: `sqrt(mean(samples²))`
+5. **Convert to dBFS**: `20 * log10(RMS)`
+6. **Apply Calibration Offset**: `dBFS + offset` (128 for UMIK-1, 94 for default)
+7. **Apply A-weighting**: Frequency-dependent correction (approximated)
+8. **Calculate Averages**: Energy-based Leq calculation for each time window
+
+### Performance
+
+- **Update Rate**: 100ms (10 readings per second)
+- **FFT Size**: 2048 samples
+- **Memory Usage**: Circular buffers for efficient data management
+- **CPU Usage**: Optimized with requestAnimationFrame
+
+---
+
 ## 📈 Roadmap
 
 ### 🔜 v1.1 (Planned)
@@ -203,66 +261,6 @@ The app applies an approximate offset of **+94 dB** for standard microphones.
 
 ---
 
-## 🛠️ Technical Details
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                    Browser                         │
-├─────────────────────────────────────────────────┤
-│  User Interface (HTML/CSS/JS)                     │
-│  ┌─────────────┐    ┌─────────────────────────┐  │
-│  │   Chart.js  │    │   Web Audio API          │  │
-│  │   Visuals   │    │   ┌─────────────────┐   │  │
-│  └─────────────┘    │   │ AudioContext    │   │  │
-│                     │   │ AnalyserNode     │   │  │
-│                     │   │ MediaStream      │   │  │
-│                     │   └─────────────────┘   │  │
-│                     └─────────────────────────┘  │
-│  ┌─────────────────────────────────────────────┐│
-│  │  SPL Calculation Engine                        ││
-│  │  - RMS calculation                             ││
-│  │  - dB conversion                               ││
-│  │  - A-weighting                                 ││
-│  │  - Time-weighted averages                      ││
-│  │  - Peak tracking                               ││
-│  └─────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────┘
-```
-
-### SPL Calculation
-
-1. **Capture Audio**: Microphone → MediaStream → AudioContext
-2. **Get Time Domain Data**: `analyser.getByteTimeDomainData()`
-3. **Convert to Float**: Normalize to -1.0 to 1.0 range
-4. **Calculate RMS**: `sqrt(mean(samples²))`
-5. **Convert to dBFS**: `20 * log10(RMS)`
-6. **Apply Calibration Offset**: `dBFS + offset` (128 for UMIK-1, 94 for default)
-7. **Apply A-weighting**: Frequency-dependent correction (approximated)
-8. **Calculate Averages**: Energy-based Leq calculation for each time window
-
-### Performance
-
-- **Update Rate**: 100ms (10 readings per second)
-- **FFT Size**: 2048 samples
-- **Memory Usage**: Circular buffers for efficient data management
-- **CPU Usage**: Optimized with requestAnimationFrame
-
----
-
-## 📦 File Structure
-
-```
-spl-meter/
-├── index.html          # Main application file
-├── README.md           # This file
-├── LICENSE             # MIT License
-└── assets/             # (Optional) Static assets
-```
-
----
-
 ## 🤝 Contributing
 
 Contributions are welcome! Please follow these guidelines:
@@ -277,17 +275,20 @@ Contributions are welcome! Please follow these guidelines:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/spl-meter.git
+git clone https://github.com/transparency-x/spl-meter.git
 cd spl-meter
 
-# Open index.html in your browser
-# No build step required!
+# Generate the HTML file
+python generate_spl_meter.py
+
+# Or serve locally for testing
+python generate_spl_meter.py --serve
 ```
 
 ### Testing
 
 - Test in multiple browsers (Chrome, Firefox, Safari, Edge)
-- Test with different microphone types
+- Test with different microphone types (UMIK-1, built-in, USB)
 - Verify calculations with known sound sources
 
 ---
@@ -309,8 +310,8 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 ## 📞 Support
 
-- **Issues**: Report bugs and request features via GitHub Issues
-- **Discussions**: Join the conversation in GitHub Discussions
+- **Issues**: Report bugs and request features via [GitHub Issues](https://github.com/transparency-x/spl-meter/issues)
+- **Discussions**: Join the conversation in [GitHub Discussions](https://github.com/transparency-x/spl-meter/discussions)
 - **Documentation**: Check the README and in-app help
 
 ---
@@ -321,7 +322,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 - **Author**: Transparency-X
 - **Maintainer**: Transparency-X
 - **Homepage**: [https://github.com/transparency-x/spl-meter](https://github.com/transparency-x/spl-meter)
-- **Keywords**: SPL, sound, audio, measurement, microphone, UMIK-1, dB, decibel, noise, acoustics
+- **Keywords**: SPL, sound, audio, measurement, microphone, UMIK-1, dB, decibel, noise, acoustics, web-audio
 
 ---
 
